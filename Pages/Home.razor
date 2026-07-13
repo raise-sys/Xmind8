@@ -51,7 +51,7 @@
 
     <section class="workspace">
         <svg @ref="CanvasElement" class="canvas" viewBox="@ViewBox" preserveAspectRatio="xMidYMid meet"
-             @onclick="ClearSelection" @onpointerdown="StartCanvasPan" @onpointerdown:preventDefault>
+             @onclick="HandleCanvasClick" @onpointerdown="StartCanvasPan" @onpointerdown:preventDefault>
             <defs>
                 <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
                     <feDropShadow dx="0" dy="4" stdDeviation="6" flood-opacity=".14" />
@@ -76,9 +76,9 @@
                 var depth = NodeDepth(node);
                 var imageY = ImageY(node);
                 var isRoot = node.Id == RootId;
-                var isSelected = node.Id == SelectedId && ImageSelectedNodeId != node.Id;
+                var isSelected = SelectedNodeIds.Contains(node.Id) && ImageSelectedNodeId != node.Id;
                 <g class="svg-topic @(isRoot ? "svg-root" : depth == 1 ? "svg-child" : "svg-descendant") @(isSelected ? "svg-selected" : "") @(node.Id == ConnectingTargetId ? "connect-target" : "")"
-                   @onclick:stopPropagation @onclick="() => Select(node)"
+                   @onclick:stopPropagation @onclick="e => Select(node, e.CtrlKey, e.ShiftKey)"
                    @ondblclick:stopPropagation @ondblclick="() => BeginEdit(node)"
                    @onpointerdown:stopPropagation @onpointerdown:preventDefault
                    @onpointerdown="e => StartDrag(e, node)">
@@ -154,6 +154,11 @@
                     }
                 </g>
             }
+            @if (IsRangeSelecting)
+            {
+                <rect class="range-selection" x="@RangeSelectionX" y="@RangeSelectionY"
+                      width="@RangeSelectionWidth" height="@RangeSelectionHeight" />
+            }
         </svg>
 
         @if (EditingNode is not null)
@@ -183,6 +188,15 @@
     private readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
     private List<MindNode> Nodes = [];
     private Guid? SelectedId;
+    private readonly HashSet<Guid> SelectedNodeIds = [];
+    private HashSet<Guid> RangeSelectionBaseIds = [];
+    private Guid? RangeSelectionBaseActiveId;
+    private bool IsRangeSelecting;
+    private bool SuppressNextCanvasClick;
+    private double RangeSelectionStartX;
+    private double RangeSelectionStartY;
+    private double RangeSelectionCurrentX;
+    private double RangeSelectionCurrentY;
     private Guid RootId;
     private DotNetObjectReference<Home>? SelfReference;
     private ElementReference CanvasElement;
@@ -196,6 +210,8 @@
     private Guid? SelectedBadgeNodeId;
     private Guid? ImageSelectedNodeId;
     private double Zoom = 1;
+    private double MindZoom = 1;
+    private double LogicZoom = 1;
     private double ViewX;
     private double ViewY;
     private string LayoutMode = "mind";
@@ -212,6 +228,10 @@
     private double ViewHeight => 900 / Zoom;
     private int ZoomPercent => (int)Math.Round(Zoom * 100);
     private string ViewBox => FormattableString.Invariant($"{ViewX} {ViewY} {ViewWidth} {ViewHeight}");
+    private double RangeSelectionX => Math.Min(RangeSelectionStartX, RangeSelectionCurrentX);
+    private double RangeSelectionY => Math.Min(RangeSelectionStartY, RangeSelectionCurrentY);
+    private double RangeSelectionWidth => Math.Abs(RangeSelectionCurrentX - RangeSelectionStartX);
+    private double RangeSelectionHeight => Math.Abs(RangeSelectionCurrentY - RangeSelectionStartY);
 
     protected override async Task OnInitializedAsync()
     {
@@ -244,7 +264,7 @@
         var root = new MindNode { Text = "中心トピック", X = 670, Y = 365, Width = 210 };
         RootId = root.Id;
         Nodes = [root];
-        SelectedId = root.Id;
+        SelectOnly(root.Id);
     }
 
     private void AddChild()
@@ -279,7 +299,7 @@
                 Math.Abs(n.X - child.X) < Math.Max(NodeWidth(n), childWidth) * .75 &&
                 Math.Abs(n.Y - candidateY) < 72), parent.Y);
         Nodes.Add(child);
-        SelectedId = child.Id;
+        SelectOnly(child.Id);
         ReflowLogicTree();
         Status = "子トピックを追加しました";
     }
@@ -289,19 +309,38 @@
         var current = SelectedNode;
         if (current is null) return;
         if (current.ParentId is null) { AddChild(); return; }
-        var siblingCount = Nodes.Count(n => n.ParentId == current.ParentId);
+        if (Find(current.ParentId.Value) is not { } parent) return;
+
+        var parentCenterX = parent.X + NodeWidth(parent) / 2;
+        var currentIsRight = current.X + NodeWidth(current) / 2 >= parentCenterX;
+        var sameSideSiblings = Nodes
+            .Where(node => node.ParentId == current.ParentId &&
+                (node.X + NodeWidth(node) / 2 >= parentCenterX) == currentIsRight)
+            .OrderBy(node => node.Y)
+            .ToList();
+        var currentIndex = sameSideSiblings.FindIndex(node => node.Id == current.Id);
+        var followingSiblings = currentIndex < 0
+            ? []
+            : sameSideSiblings.Skip(currentIndex + 1).ToList();
+
+        const double verticalGap = 18;
         var sibling = new MindNode {
             Text = "新しいトピック", ParentId = current.ParentId,
-            X = Math.Clamp(current.X, 30, 1370),
-            Y = Math.Clamp(current.Y + 115, 30, 800)
+            X = current.X,
+            Y = current.Y + NodeHeight(current) + verticalGap
         };
-        // 同じ位置に重ならないよう、空いている方向へずらす。
-        while (Nodes.Any(n => Math.Abs(n.X - sibling.X) < 20 && Math.Abs(n.Y - sibling.Y) < 70))
-            sibling.Y = Math.Clamp(sibling.Y + 105, 30, 800);
+
+        // 新しい兄弟を選択セルの直後へ挿入し、それより下の兄弟と各子孫を順に再配置する。
+        var nextY = sibling.Y + NodeHeight(sibling) + verticalGap;
+        foreach (var following in followingSiblings)
+        {
+            MoveSubtree(following.Id, 0, nextY - following.Y);
+            nextY = following.Y + NodeHeight(following) + verticalGap;
+        }
         Nodes.Add(sibling);
-        SelectedId = sibling.Id;
-        ReflowLogicTree();
-        Status = "同じ階層にトピックを追加しました";
+        SelectOnly(sibling.Id);
+        SaveLayoutPositions(LayoutMode);
+        Status = "選択したセルのすぐ下に兄弟トピックを追加しました";
     }
 
     private void ReorderSibling(bool moveUp)
@@ -329,7 +368,7 @@
             Status = moveUp ? "上に兄弟セルがありません" : "下に兄弟セルがありません";
             return;
         }
-        SelectedId = target.Id;
+        SelectOnly(target.Id);
         Status = moveUp ? "上の兄弟セルを選択しました" : "下の兄弟セルを選択しました";
     }
 
@@ -367,7 +406,7 @@
             var child = Nodes.Where(n => n.ParentId == node.Id)
                 .Where(n => arrowRight ? n.X >= node.X : n.X < node.X)
                 .OrderBy(n => Math.Abs(n.Y - node.Y)).FirstOrDefault();
-            if (child is not null) SelectedId = child.Id;
+            if (child is not null) SelectOnly(child.Id);
             Status = child is null ? "その方向に子セルがありません" : "子セルへ選択を移動しました";
             return;
         }
@@ -376,14 +415,14 @@
         var towardRoot = arrowRight != nodeIsRight;
         if (towardRoot)
         {
-            if (node.ParentId is not null) SelectedId = node.ParentId;
+            if (node.ParentId is not null) SelectOnly(node.ParentId);
             Status = "親セルへ選択を移動しました";
             return;
         }
 
         var nearestChild = Nodes.Where(n => n.ParentId == node.Id)
             .OrderBy(n => Math.Abs(n.Y - node.Y)).FirstOrDefault();
-        if (nearestChild is not null) SelectedId = nearestChild.Id;
+        if (nearestChild is not null) SelectOnly(nearestChild.Id);
         Status = nearestChild is null ? "子セルがありません" : "子セルへ選択を移動しました";
     }
 
@@ -422,7 +461,7 @@
         parent.ParentId = child.Id;
         (parent.X, child.X) = (child.X, parent.X);
         (parent.Y, child.Y) = (child.Y, parent.Y);
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         Status = "親セルと子セルを入れ替えました";
     }
 
@@ -435,19 +474,22 @@
 
     private void DeleteSelected()
     {
-        if (SelectedNode is not { } node || node.Id == RootId) return;
-        var ids = new HashSet<Guid> { node.Id };
-        while (Nodes.Any(n => n.ParentId is not null && ids.Contains(n.ParentId.Value) && ids.Add(n.Id))) { }
+        var selected = Nodes.Where(node => SelectedNodeIds.Contains(node.Id) && node.Id != RootId).ToList();
+        if (selected.Count == 0) return;
+        var fallbackId = SelectedNode?.ParentId;
+        var ids = selected.Select(node => node.Id).ToHashSet();
+        while (Nodes.Any(node => node.ParentId is not null && ids.Contains(node.ParentId.Value) && ids.Add(node.Id))) { }
+        var removedCount = ids.Count;
         Nodes.RemoveAll(n => ids.Contains(n.Id));
-        SelectedId = node.ParentId;
+        SelectOnly(fallbackId is not null && Nodes.Any(node => node.Id == fallbackId) ? fallbackId : RootId);
         ReflowLogicTree();
-        Status = "トピックを削除しました";
+        Status = removedCount == 1 ? "トピックを削除しました" : $"選択したトピックをまとめて削除しました（{removedCount}件）";
     }
 
     private void DeleteConnector(MindNode child)
     {
         child.ParentId = null;
-        SelectedId = child.Id;
+        SelectOnly(child.Id);
         Status = "コネクターを削除しました（セルは残っています）";
     }
 
@@ -463,7 +505,7 @@
     private void SelectBadge(MindNode node)
     {
         ImageSelectedNodeId = null;
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         SelectedBadgeNodeId = node.Id;
         Status = "バッジを選択しました。Deleteキーで削除できます";
     }
@@ -480,13 +522,73 @@
     private void SelectImage(MindNode node)
     {
         SelectedBadgeNodeId = null;
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         ImageSelectedNodeId = node.Id;
         Status = "画像を選択しました。角をドラッグしてサイズ変更、Alt+↑↓で文字との順序を変更できます";
     }
 
-    private void Select(MindNode node) { if (EditingNodeId is not null) EndEdit(); SelectedBadgeNodeId = null; ImageSelectedNodeId = null; SelectedId = node.Id; Status = "閲覧モード：ドラッグで移動、F2で編集"; }
-    private void ClearSelection() { if (EditingNodeId is not null) EndEdit(); SelectedBadgeNodeId = null; ImageSelectedNodeId = null; SelectedId = null; Status = "トピックを選択してください"; }
+    private void Select(MindNode node, bool ctrlKey, bool shiftKey)
+    {
+        if (EditingNodeId is not null) EndEdit();
+        SelectedBadgeNodeId = null;
+        ImageSelectedNodeId = null;
+
+        if (ctrlKey)
+        {
+            if (!SelectedNodeIds.Add(node.Id))
+            {
+                SelectedNodeIds.Remove(node.Id);
+                if (SelectedId == node.Id)
+                    SelectedId = Nodes.LastOrDefault(candidate => SelectedNodeIds.Contains(candidate.Id))?.Id;
+            }
+            else
+            {
+                SelectedId = node.Id;
+            }
+        }
+        else if (shiftKey)
+        {
+            SelectedNodeIds.Add(node.Id);
+            SelectedId = node.Id;
+        }
+        else
+        {
+            SelectOnly(node.Id);
+        }
+
+        Status = SelectedNodeIds.Count switch
+        {
+            0 => "トピックを選択してください",
+            1 => "閲覧モード：ドラッグで移動、F2で編集",
+            _ => $"{SelectedNodeIds.Count}個のトピックを選択しています"
+        };
+    }
+
+    private void SelectOnly(Guid? nodeId)
+    {
+        SelectedNodeIds.Clear();
+        SelectedId = nodeId;
+        if (nodeId is not null) SelectedNodeIds.Add(nodeId.Value);
+    }
+
+    private void HandleCanvasClick()
+    {
+        if (SuppressNextCanvasClick)
+        {
+            SuppressNextCanvasClick = false;
+            return;
+        }
+        ClearSelection();
+    }
+
+    private void ClearSelection()
+    {
+        if (EditingNodeId is not null) EndEdit();
+        SelectedBadgeNodeId = null;
+        ImageSelectedNodeId = null;
+        SelectOnly(null);
+        Status = "トピックを選択してください";
+    }
     private MindNode? Find(Guid id) => Nodes.FirstOrDefault(n => n.Id == id);
     private double NodeHeight(MindNode node)
     {
@@ -563,23 +665,18 @@
         if (mode is not ("mind" or "logic")) return;
         if (mode == LayoutMode) return;
         SaveLayoutPositions(LayoutMode);
+        SaveCurrentModeZoom();
         LayoutMode = mode;
         if (mode == "logic")
         {
             ApplyAutomaticLayout();
             SaveLayoutPositions(mode);
         }
-        else if (!RestoreLayoutPositions(mode))
-        {
-            ApplyAutomaticLayout();
-            SaveLayoutPositions(mode);
-        }
         else
         {
-            Zoom = 1;
-            ViewX = 0;
-            ViewY = 0;
+            RestoreMindMapPositionsAndPlaceNewNodes();
         }
+        RestoreModeZoom(mode);
         Status = mode == "mind" ? "マインドマップモードへ切り替えました" : "ロジックツリーモードへ切り替えました";
     }
     private void ChangeToMindMap() => ChangeLayoutMode("mind");
@@ -594,19 +691,125 @@
         }
     }
 
-    private bool RestoreLayoutPositions(string mode)
+    private void SaveCurrentModeZoom()
     {
-        if (Nodes.Count == 0) return false;
-        var available = mode == "logic"
-            ? Nodes.All(node => node.LogicX is not null && node.LogicY is not null)
-            : Nodes.All(node => node.MindX is not null && node.MindY is not null);
-        if (!available) return false;
-        foreach (var node in Nodes)
+        if (LayoutMode == "logic") LogicZoom = NormalizeZoom(Zoom);
+        else MindZoom = NormalizeZoom(Zoom);
+    }
+
+    private void RestoreModeZoom(string mode)
+    {
+        Zoom = NormalizeZoom(mode == "logic" ? LogicZoom : MindZoom);
+        ViewX = 0;
+        ViewY = 0;
+    }
+
+    private static double NormalizeZoom(double zoom)
+        => double.IsFinite(zoom) && zoom > 0 ? Math.Clamp(zoom, .4, 2.5) : 1;
+
+    private void RestoreMindMapPositionsAndPlaceNewNodes()
+    {
+        if (Nodes.Count == 0) return;
+        var positionedIds = Nodes
+            .Where(node => node.MindX is not null && node.MindY is not null)
+            .Select(node => node.Id)
+            .ToHashSet();
+
+        // 保存済みのマインドマップ座標は一切動かさず、そのまま復元する。
+        foreach (var node in Nodes.Where(node => positionedIds.Contains(node.Id)))
         {
-            node.X = mode == "logic" ? node.LogicX!.Value : node.MindX!.Value;
-            node.Y = mode == "logic" ? node.LogicY!.Value : node.MindY!.Value;
+            node.X = node.MindX!.Value;
+            node.Y = node.MindY!.Value;
         }
-        return true;
+
+        // 以前のマインドマップ座標が1件もない古いデータだけは、従来どおり全体配置する。
+        if (positionedIds.Count == 0)
+        {
+            ApplyAutomaticLayout();
+            SaveLayoutPositions("mind");
+            return;
+        }
+
+        if (!positionedIds.Contains(RootId) && Find(RootId) is { } rootWithoutPosition)
+        {
+            rootWithoutPosition.X = 800 - NodeWidth(rootWithoutPosition) / 2;
+            rootWithoutPosition.Y = 450 - NodeHeight(rootWithoutPosition) / 2;
+            positionedIds.Add(rootWithoutPosition.Id);
+        }
+
+        // ロジックツリーで追加されたセルだけを、復元済みの親の近くにある空き位置へ置く。
+        foreach (var node in Nodes.Where(node => !positionedIds.Contains(node.Id)).OrderBy(NodeDepth).ToList())
+        {
+            PlaceNewMindMapNode(node, positionedIds);
+            positionedIds.Add(node.Id);
+        }
+
+        SaveLayoutPositions("mind");
+        Zoom = 1;
+        ViewX = 0;
+        ViewY = 0;
+    }
+
+    private void PlaceNewMindMapNode(MindNode node, HashSet<Guid> positionedIds)
+    {
+        var root = Find(RootId);
+        var parent = node.ParentId is not null ? Find(node.ParentId.Value) : root;
+        if (root is null || parent is null)
+        {
+            node.X = 800;
+            node.Y = 450;
+            return;
+        }
+
+        int direction;
+        if (parent.Id == RootId)
+        {
+            var rootCenterX = root.X + NodeWidth(root) / 2;
+            var positionedChildren = Nodes.Where(candidate =>
+                positionedIds.Contains(candidate.Id) && candidate.ParentId == root.Id).ToList();
+            var leftCount = positionedChildren.Count(candidate => candidate.X + NodeWidth(candidate) / 2 < rootCenterX);
+            direction = positionedChildren.Count - leftCount <= leftCount ? 1 : -1;
+        }
+        else
+        {
+            direction = parent.X + NodeWidth(parent) / 2 >= root.X + NodeWidth(root) / 2 ? 1 : -1;
+        }
+
+        const double horizontalGap = 90;
+        var nodeWidth = NodeWidth(node);
+        node.X = direction > 0
+            ? parent.X + NodeWidth(parent) + horizontalGap
+            : parent.X - nodeWidth - horizontalGap;
+
+        var baseY = parent.Y + (NodeHeight(parent) - NodeHeight(node)) / 2;
+        var verticalStep = Math.Max(74, NodeHeight(node) + 22);
+        var maxAttempts = Math.Max(16, Nodes.Count * 4);
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            var ring = (attempt + 1) / 2;
+            var offset = attempt == 0 ? 0 : (attempt % 2 == 1 ? ring : -ring) * verticalStep;
+            var candidateY = baseY + offset;
+            if (!OverlapsPositionedNode(node, node.X, candidateY, positionedIds))
+            {
+                node.Y = candidateY;
+                return;
+            }
+        }
+
+        node.Y = baseY + (maxAttempts + 1) * verticalStep;
+    }
+
+    private bool OverlapsPositionedNode(MindNode node, double x, double y, HashSet<Guid> positionedIds)
+    {
+        const double horizontalMargin = 24;
+        const double verticalMargin = 18;
+        var width = NodeWidth(node);
+        var height = NodeHeight(node);
+        return Nodes.Where(other => positionedIds.Contains(other.Id)).Any(other =>
+            x < other.X + NodeWidth(other) + horizontalMargin &&
+            x + width + horizontalMargin > other.X &&
+            y < other.Y + NodeHeight(other) + verticalMargin &&
+            y + height + verticalMargin > other.Y);
     }
 
     private void ApplyAutomaticLayout()
@@ -647,7 +850,7 @@
     private void ToggleCollapse(MindNode node)
     {
         node.IsCollapsed = !node.IsCollapsed;
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         if (Find(RootId) is { } root) ApplyLogicTreeLayout(root);
         SaveLayoutPositions("logic");
         Status = node.IsCollapsed ? "配下のセルを折りたたみました" : "配下のセルを展開しました";
@@ -752,7 +955,8 @@
     private async Task StartDrag(PointerEventArgs e, MindNode node)
     {
         if (EditingNodeId is not null) return;
-        SelectedId = node.Id;
+        if (e.CtrlKey || e.ShiftKey) return;
+        SelectOnly(node.Id);
         DraggingNodeId = node.Id;
         ConnectingTargetId = null;
         Status = "ドラッグしてトピックを移動できます";
@@ -762,7 +966,7 @@
 
     private async Task StartImageResize(PointerEventArgs e, MindNode node, int corner)
     {
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         var cornerName = corner switch { 0 => "nw", 1 => "ne", 2 => "sw", _ => "se" };
         await JS.InvokeVoidAsync("mindCanvas.startImageResize", node.Id.ToString(), CanvasElement,
             e.ClientX, e.ClientY, node.X, node.Y, NodeWidth(node), NodeHeight(node), cornerName);
@@ -793,8 +997,72 @@
     private async Task StartCanvasPan(PointerEventArgs e)
     {
         if (EditingNodeId is not null) EndEdit();
+        if (e.CtrlKey)
+        {
+            SelectedBadgeNodeId = null;
+            ImageSelectedNodeId = null;
+            await JS.InvokeVoidAsync("mindCanvas.startRangeSelection", CanvasElement, e.ClientX, e.ClientY);
+            return;
+        }
         await JS.InvokeVoidAsync("mindCanvas.startCanvasPan", CanvasElement, e.ClientX, e.ClientY,
             ViewX, ViewY, ViewWidth, ViewHeight);
+    }
+
+    [JSInvokable]
+    public Task BeginRangeSelection(double x, double y)
+    {
+        RangeSelectionBaseIds = SelectedNodeIds.ToHashSet();
+        RangeSelectionBaseActiveId = SelectedId;
+        RangeSelectionStartX = RangeSelectionCurrentX = x;
+        RangeSelectionStartY = RangeSelectionCurrentY = y;
+        IsRangeSelecting = true;
+        SuppressNextCanvasClick = true;
+        Status = "範囲をドラッグして複数選択します";
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public Task UpdateRangeSelection(double x, double y)
+    {
+        if (!IsRangeSelecting) return Task.CompletedTask;
+        RangeSelectionCurrentX = x;
+        RangeSelectionCurrentY = y;
+
+        SelectedNodeIds.Clear();
+        SelectedNodeIds.UnionWith(RangeSelectionBaseIds);
+        var nodesInRange = VisibleNodes.Where(NodeIntersectsRangeSelection).ToList();
+        SelectedNodeIds.UnionWith(nodesInRange.Select(node => node.Id));
+        SelectedId = nodesInRange.LastOrDefault()?.Id
+            ?? (RangeSelectionBaseActiveId is not null && SelectedNodeIds.Contains(RangeSelectionBaseActiveId.Value)
+                ? RangeSelectionBaseActiveId
+                : Nodes.LastOrDefault(node => SelectedNodeIds.Contains(node.Id))?.Id);
+        Status = SelectedNodeIds.Count == 0
+            ? "範囲内にトピックがありません"
+            : $"{SelectedNodeIds.Count}個のトピックを選択しています";
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private bool NodeIntersectsRangeSelection(MindNode node)
+    {
+        var right = RangeSelectionX + RangeSelectionWidth;
+        var bottom = RangeSelectionY + RangeSelectionHeight;
+        return node.X < right && node.X + NodeWidth(node) > RangeSelectionX &&
+               node.Y < bottom && node.Y + NodeHeight(node) > RangeSelectionY;
+    }
+
+    [JSInvokable]
+    public Task EndRangeSelection()
+    {
+        IsRangeSelecting = false;
+        Status = SelectedNodeIds.Count == 0
+            ? "トピックを選択してください"
+            : SelectedNodeIds.Count == 1
+                ? "1個のトピックを選択しています"
+                : $"{SelectedNodeIds.Count}個のトピックを選択しています";
+        StateHasChanged();
+        return Task.CompletedTask;
     }
 
     [JSInvokable]
@@ -911,7 +1179,7 @@
 
     private async Task BeginEdit(MindNode node)
     {
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         EditingNodeId = node.Id;
         EditOriginalText = node.Text;
         EditOriginalWidth = NodeWidth(node);
@@ -924,7 +1192,7 @@
     {
         SelectedBadgeNodeId = null;
         ImageSelectedNodeId = null;
-        SelectedId = node.Id;
+        SelectOnly(node.Id);
         EditingNodeId = node.Id;
         EditOriginalText = node.Text;
         EditOriginalWidth = NodeWidth(node);
@@ -1207,7 +1475,14 @@
     private string Serialize()
     {
         SaveLayoutPositions(LayoutMode);
-        return JsonSerializer.Serialize(new MindMapDocument { RootId = RootId, Nodes = Nodes, LayoutMode = LayoutMode }, JsonOptions);
+        SaveCurrentModeZoom();
+        return JsonSerializer.Serialize(new MindMapDocument {
+            RootId = RootId,
+            Nodes = Nodes,
+            LayoutMode = LayoutMode,
+            MindZoom = MindZoom,
+            LogicZoom = LogicZoom
+        }, JsonOptions);
     }
     private void UpdateDocumentName(ChangeEventArgs e) => DocumentName = e.Value?.ToString() ?? "";
     private void UpdateSelectedFolderFile(ChangeEventArgs e) => SelectedFolderFile = e.Value?.ToString() ?? "";
@@ -1276,8 +1551,11 @@
             var document = JsonSerializer.Deserialize<MindMapDocument>(json, JsonOptions);
             if (document?.Nodes is not { Count: > 0 }) return;
             Nodes = document.Nodes; RootId = document.RootId; LayoutMode = document.LayoutMode is "logic" ? "logic" : "mind";
+            MindZoom = NormalizeZoom(document.MindZoom);
+            LogicZoom = NormalizeZoom(document.LogicZoom);
+            RestoreModeZoom(LayoutMode);
             SaveLayoutPositions(LayoutMode);
-            SelectedId = RootId; Status = "マインドマップを読み込みました";
+            SelectOnly(RootId); Status = "マインドマップを読み込みました";
         } catch { Status = "ファイルを読み込めませんでした"; }
     }
 
@@ -1287,7 +1565,14 @@
         SelfReference?.Dispose();
     }
 
-    private sealed class MindMapDocument { public Guid RootId { get; set; } public string LayoutMode { get; set; } = "mind"; public List<MindNode> Nodes { get; set; } = []; }
+    private sealed class MindMapDocument
+    {
+        public Guid RootId { get; set; }
+        public string LayoutMode { get; set; } = "mind";
+        public double MindZoom { get; set; } = 1;
+        public double LogicZoom { get; set; } = 1;
+        public List<MindNode> Nodes { get; set; } = [];
+    }
     private sealed class MindNode
     {
         public Guid Id { get; set; } = Guid.NewGuid();

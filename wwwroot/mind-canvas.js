@@ -2,6 +2,7 @@ window.mindCanvas = (() => {
     let dotnet;
     let activeDrag;
     let activePan;
+    let activeRangeSelection;
     let activeResize;
     let saveDirectory;
     const shortcut = event => {
@@ -185,6 +186,33 @@ window.mindCanvas = (() => {
         window.addEventListener('pointercancel', endPan, true);
     };
 
+    const moveRangeSelection = event => {
+        if (!activeRangeSelection || !dotnet) return;
+        event.preventDefault();
+        const point = svgPoint(activeRangeSelection.svg, event.clientX, event.clientY);
+        dotnet.invokeMethodAsync('UpdateRangeSelection', point.x, point.y);
+    };
+
+    const endRangeSelection = () => {
+        if (!activeRangeSelection) return;
+        activeRangeSelection = null;
+        window.removeEventListener('pointermove', moveRangeSelection, true);
+        window.removeEventListener('pointerup', endRangeSelection, true);
+        window.removeEventListener('pointercancel', endRangeSelection, true);
+        dotnet?.invokeMethodAsync('EndRangeSelection');
+    };
+
+    const startRangeSelection = (svg, clientX, clientY) => {
+        endPan();
+        endRangeSelection();
+        const point = svgPoint(svg, clientX, clientY);
+        activeRangeSelection = { svg };
+        dotnet?.invokeMethodAsync('BeginRangeSelection', point.x, point.y);
+        window.addEventListener('pointermove', moveRangeSelection, { capture: true, passive: false });
+        window.addEventListener('pointerup', endRangeSelection, true);
+        window.addEventListener('pointercancel', endRangeSelection, true);
+    };
+
     const moveResize = event => {
         if (!activeResize || !dotnet) return;
         event.preventDefault();
@@ -280,6 +308,7 @@ window.mindCanvas = (() => {
         readYoutubeLink,
         startNodeDrag,
         startCanvasPan,
+        startRangeSelection,
         startImageResize,
         showEditor,
         selectFolder,

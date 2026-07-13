@@ -50,6 +50,7 @@
 .svg-child .topic-box { fill: #dff4ff; stroke: #1769aa; stroke-width: 2; }
 .topic-grip, .grip-dot { display: none !important; fill: transparent !important; }
 .selection-ring { fill: rgba(102,84,232,.10); stroke: #6654e8; stroke-width: 3; }
+.range-selection { fill: rgba(47,128,237,.12); stroke: #2f80ed; stroke-width: 2; stroke-dasharray: 8 5; pointer-events: none; }
 .connect-target .topic-box { stroke: #20a66a; stroke-width: 5; filter: drop-shadow(0 0 7px rgba(32,166,106,.55)); }
 .editing-ring { fill: none; stroke: #f0933f; stroke-width: 4; stroke-dasharray: 8 5; }
 .topic-text { fill: #30394d; font-size: 15px; font-weight: 650; pointer-events: none; }
